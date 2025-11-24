@@ -1,150 +1,102 @@
+// ===============================
+// Deepgram Streaming STT VR Server (English-only)
+// ===============================
 
-const fs = require('fs');
-const http = require('http');
-const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid');
-const OpenAI = require('openai');
+const http = require("http");
+const WebSocket = require("ws");
+const { Deepgram } = require("@deepgram/sdk");
+const OpenAI = require("openai");
 
+// Initialize clients
+const deepgram = new Deepgram(process.env.DEEPGRAM_API_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// HTTP server for Render
+// Simple HTTP endpoint for Render health checks
 const server = http.createServer((req, res) => {
     res.writeHead(200);
-    res.end("Voice WS server");
+    res.end("Deepgram VR STT Server OK");
 });
 
+// Main WebSocket server
 const wss = new WebSocket.Server({ server, path: "/ws" });
+console.log("WebSocket server ready.");
 
-wss.on("connection", (ws) => {
+wss.on("connection", async (ws) => {
     console.log("Client connected");
 
-    let chunks = [];
-    let sampleRate = 16000;
-    let bytesCollected = 0;
+    // Create Deepgram live stream
+    const dg = deepgram.listen.live({
+        model: "nova-2",
+        language: "en",           // You requested EN only
+        smart_format: true,
+        encoding: "linear16",
+        sample_rate: 16000,
+        channels: 1,
+        interim_results: false,
+        vad_events: true          // Deepgram will detect speech boundaries
+    });
 
-    ws.on("message", async (message) => {
+    // Deepgram stream events
+    dg.on("open", () => console.log("Deepgram stream opened"));
+    dg.on("close", () => console.log("Deepgram stream closed"));
+    dg.on("error", (err) => console.error("Deepgram error:", err));
+
+    // When Deepgram detects speech and returns text
+    dg.on("transcriptReceived", async (data) => {
+        try {
+            const alt = data.channel.alternatives[0];
+            if (!alt || !alt.transcript) return;
+
+            const text = alt.transcript.trim();
+            if (text.length < 2) return;  // ignore tiny noises
+
+            console.log("STT:", text);
+
+            // Now send text to LLM
+            const llm = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [{ role: "user", content: text }],
+                max_tokens: 200,
+                temperature: 0.5
+            });
+
+            const response = llm.choices[0].message.content.trim();
+            console.log("LLM:", response);
+
+            // Send processed message back to Unity
+            ws.send(JSON.stringify({
+                type: "llm_response",
+                transcript: text,
+                response: response
+            }));
+
+        } catch (err) {
+            console.error("LLM processing error:", err);
+        }
+    });
+
+    // Unity audio chunks → pass straight to Deepgram
+    ws.on("message", (msg) => {
         let obj;
         try {
-            obj = JSON.parse(message.toString());
+            obj = JSON.parse(msg.toString());
         } catch {
-            console.warn("Invalid JSON");
             return;
         }
 
         if (obj.type !== "audio_chunk") return;
 
         const pcm16 = Buffer.from(obj.audio, "base64");
-        sampleRate = obj.sampleRate ?? sampleRate;
-
-        chunks.push(pcm16);
-        bytesCollected += pcm16.length;
-
-        const bytesPerSec = sampleRate * 2;
-        const needed = bytesPerSec * 2; // ~2 seconds chunks
-
-        if (bytesCollected >= needed) {
-            // finalize audio
-            const buf = Buffer.concat(chunks);
-            chunks = [];
-            bytesCollected = 0;
-
-            const filename = `/tmp/audio_${uuidv4()}.wav`;
-            saveWav(buf, sampleRate, filename);
-
-            // --- TRANSCRIBE ---
-            const transcript = await transcribe(filename);
-            console.log("Transcript:", transcript);
-
-            // Ignore empty/noise transcripts
-            if (!transcript || transcript.trim().length < 2) {
-                console.log("Ignored short transcript");
-                return;
-            }
-
-            // --- LLM RESPONSE ---
-           
-if (!transcript || transcript.trim().length < 3) {
-    console.log("Silence detected — no LLM call.");
-    return;
-}
-
-const llmResponse = await safeQueryLLM(transcript);
-
-safeSend(ws, {
-    type: 'llm_response',
-    transcript,
-    response: llmResponse,
-    filename
-});
-        }
+        dg.send(pcm16);
     });
 
-    ws.on("close", () => console.log("Client disconnected"));
+    // When Unity disconnects
+    ws.on("close", () => {
+        console.log("Client disconnected");
+        dg.finish();
+    });
 });
 
-// ---- Helpers ----
-
-function safeSend(ws, obj) {
-    try {
-        ws.send(JSON.stringify(obj));
-    } catch (err) {
-        console.error("Send error:", err);
-    }
-}
-
-function saveWav(pcmBuffer, sampleRate, outPath) {
-    const numChannels = 1;
-    const bitsPerSample = 16;
-    const byteRate = sampleRate * numChannels * bitsPerSample / 8;
-    const blockAlign = numChannels * bitsPerSample / 8;
-    const dataSize = pcmBuffer.length;
-
-    const header = Buffer.alloc(44);
-    header.write("RIFF", 0);
-    header.writeUInt32LE(36 + dataSize, 4);
-    header.write("WAVE", 8);
-    header.write("fmt ", 12);
-    header.writeUInt32LE(16, 16);
-    header.writeUInt16LE(1, 20);
-    header.writeUInt16LE(numChannels, 22);
-    header.writeUInt32LE(sampleRate, 24);
-    header.writeUInt32LE(byteRate, 28);
-    header.writeUInt16LE(blockAlign, 32);
-    header.writeUInt16LE(bitsPerSample, 34);
-    header.write("data", 36);
-    header.writeUInt32LE(dataSize, 40);
-
-    fs.writeFileSync(outPath, Buffer.concat([header, pcmBuffer]));
-}
-
-async function transcribe(path) {
-    try {
-        const resp = await openai.audio.transcriptions.create({
-            file: fs.createReadStream(path),
-            model: "whisper-1"
-        });
-        return resp.text || "";
-    } catch (e) {
-        console.error("STT error", e);
-        return "";
-    }
-}
-
-async function runLLM(prompt) {
-    try {
-        const r = await openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [{ role: "user", content: prompt }],
-            temperature: 0.6,
-            max_tokens: 150
-        });
-        return r.choices?.[0]?.message?.content || "";
-    } catch (e) {
-        console.error("LLM error", e);
-        return "I'm sorry, I couldn't process that.";
-    }
-}
-
-// START
+// Start server
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log("Listening on", PORT));
