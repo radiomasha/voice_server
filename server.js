@@ -1,7 +1,3 @@
-// ================================================
-// Deepgram v3 — RAW PCM Streaming Server (WORKING)
-// ================================================
-
 const http = require("http");
 const WebSocket = require("ws");
 const { createClient } = require("@deepgram/sdk");
@@ -12,62 +8,77 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const server = http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("Server OK");
+  res.end("Deepgram server OK");
 });
 
-const wss = new WebSocket.Server({ server, path: "/ws" });
-console.log("WS ready.");
+// CORRECT WS CONFIG
+const wss = new WebSocket.Server({
+  server,
+  path: "/ws",
+  maxPayload: 1024 * 1024,
+  perMessageDeflate: false
+});
+
+console.log("WebSocket ready.");
 
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // --- Deepgram Live Session (WORKING) ---
+  const pingInterval = setInterval(() => {
+    try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
+  }, 8000);
+
+  // Correct Deepgram v3 setup
   const live = await dg.listen.live({
     model: "nova-2",
+    language: "en",
     encoding: "linear16",
     sample_rate: 16000,
     channels: 1,
+    raw: true,      // <-- REQUIRED FOR PCM STREAMS
     vad_events: true,
     interim_results: false,
     punctuate: true,
   });
 
-  live.on("open", () => console.log("Deepgram OPEN"));
-  live.on("error", (e) => console.error("DG ERROR", e));
+  live.on("open", () => console.log("Deepgram session opened."));
+  live.on("error", (err) => console.error("Deepgram ERROR:", err));
 
-  live.on("transcript", async (d) => {
-    const t = d?.channel?.alternatives?.[0]?.transcript?.trim();
-    if (!t) return;
+  live.on("transcript", async (data) => {
+    const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
+    if (!transcript) return;
 
-    console.log("STT:", t);
+    console.log("STT:", transcript);
 
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: [{ role: "user", content: t }],
-      max_tokens: 150,
+      messages: [{ role: "user", content: transcript }],
       temperature: 0.2,
+      max_tokens: 200,
     });
 
-    const answer = resp.choices?.[0]?.message?.content?.trim() || "";
-    console.log("LLM:", answer);
-
+    const answer = resp.choices?.[0]?.message?.content?.trim();
     ws.send(JSON.stringify({
       type: "llm_response",
-      transcript: t,
-      response: answer
+      transcript,
+      response: answer,
     }));
+
+    console.log("LLM:", answer);
   });
 
-  // --- RECEIVE RAW PCM BYTES ---
   ws.on("message", (buffer) => {
-    if (!Buffer.isBuffer(buffer)) return;
+    console.log("PCM bytes received:", buffer.length);
     live.send(buffer);
   });
 
   ws.on("close", () => {
-    console.log("Client disconnected");
+    clearInterval(pingInterval);
     try { live.finish(); } catch {}
+    console.log("Client disconnected");
   });
+
 });
 
-server.listen(10000, () => console.log("Listening on 10000"));
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => console.log("Listening on port", PORT));
