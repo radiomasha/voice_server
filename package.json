@@ -2,12 +2,13 @@
   "name": "voice-server",
   "version": "1.0.0",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@deepgram/sdk": "^3.3.0",
-    "openai": "^4.0.0",
-    "ws": "^8.17.0"
+    "@deepgram/sdk": "3.3.0",
+    "openai": "4.0.0",
+    "ws": "8.17.0"
   }
 }
