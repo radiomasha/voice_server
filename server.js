@@ -1,6 +1,6 @@
 // ======================================
 // Deepgram v3 Streaming Server
-// Unity 48k PCM → 16k linear16
+// Unity 48k PCM → 16k PCM16 chunks
 // ======================================
 
 const http = require("http");
@@ -19,15 +19,14 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server, path: "/ws" });
 console.log("WebSocket ready.");
 
-// =========================
-// WS CONNECTION
-// =========================
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // HEARTBEAT (Render fix)
+  // Render anti-idle
   const pingInterval = setInterval(() => {
-    try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
+    try {
+      ws.send(JSON.stringify({ type: "ping" }));
+    } catch {}
   }, 8000);
 
   // Deepgram live stream
@@ -38,30 +37,29 @@ wss.on("connection", async (ws) => {
     sample_rate: 16000,
     channels: 1,
     vad_events: true,
-    interim_results: false,
     punctuate: true,
+    interim_results: false,
   });
 
   live.on("open", () => console.log("Deepgram session opened."));
   live.on("error", (err) => console.error("Deepgram ERROR:", err));
 
-  // TRANSCRIPT EVENT
+  // STT → GPT → Unity
   live.on("transcript", async (data) => {
     const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
-
     if (!transcript || transcript.length < 2) return;
 
     console.log("STT:", transcript);
 
     try {
-      const resp = await openai.chat.completions.create({
+      const r = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: transcript }],
-        max_tokens: 150,
         temperature: 0.2,
+        max_tokens: 150,
       });
 
-      const answer = resp.choices?.[0]?.message?.content?.trim() || "";
+      const answer = r.choices?.[0]?.message?.content?.trim() || "";
       console.log("LLM:", answer);
 
       ws.send(
@@ -76,7 +74,6 @@ wss.on("connection", async (ws) => {
     }
   });
 
-  // RECEIVE AUDIO FROM UNITY
   ws.on("message", (msg) => {
     let obj;
     try {
@@ -88,15 +85,15 @@ wss.on("connection", async (ws) => {
     if (obj.type !== "audio_chunk") return;
 
     const pcm = Buffer.from(obj.audio, "base64");
-    console.log("PCM bytes received:", pcm.length);
-
     live.send(pcm);
   });
 
   ws.on("close", () => {
-    clearInterval(pingInterval);
-    try { live.finish(); } catch {}
     console.log("Client disconnected");
+    clearInterval(pingInterval);
+    try {
+      live.finish();
+    } catch {}
   });
 });
 
