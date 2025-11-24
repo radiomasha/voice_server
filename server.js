@@ -1,6 +1,3 @@
-// server.js (drop-in for Render)
-// Requirements: node 18+, packages: ws, uuid, openai
-// Env: OPENAI_API_KEY
 
 const fs = require('fs');
 const http = require('http');
@@ -8,156 +5,89 @@ const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const OpenAI = require('openai');
 
-// --- Init OpenAI client ---
-if (!process.env.OPENAI_API_KEY) {
-    console.error("OPENAI_API_KEY is not set in environment!");
-}
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- HTTP server (Render expects a web service) ---
+// HTTP server for Render
 const server = http.createServer((req, res) => {
     res.writeHead(200);
-    res.end('Voice WS server');
+    res.end("Voice WS server");
 });
 
-// --- WebSocket server on path /ws ---
-const wss = new WebSocket.Server({ server, path: '/ws' });
+const wss = new WebSocket.Server({ server, path: "/ws" });
 
-console.log('WS server created, waiting for connections...');
-
-// --- Periodic cleanup of /tmp audio files (1 hour) ---
-const CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
-const TMP_DIR = '/tmp';
-setInterval(() => {
-    fs.readdir(TMP_DIR, (err, files) => {
-        if (err) return;
-        files.filter(f => f.startsWith('audio_') && f.endsWith('.wav')).forEach(f => {
-            const p = `${TMP_DIR}/${f}`;
-            fs.unlink(p, (err) => {
-                if (!err) console.log('Deleted old audio file:', f);
-            });
-        });
-    });
-}, CLEANUP_INTERVAL);
-
-// --- WebSocket connection handler ---
-wss.on('connection', (ws, req) => {
-    console.log('Client connected from', req.socket.remoteAddress);
+wss.on("connection", (ws) => {
+    console.log("Client connected");
 
     let chunks = [];
     let sampleRate = 16000;
     let bytesCollected = 0;
 
-    ws.on('message', async (message) => {
+    ws.on("message", async (message) => {
+        let obj;
         try {
-            if (!message) return;
-            const str = message.toString();
-            if (!str) return;
+            obj = JSON.parse(message.toString());
+        } catch {
+            console.warn("Invalid JSON");
+            return;
+        }
 
-            let obj;
-            try {
-                obj = JSON.parse(str);
-            } catch (parseErr) {
-                console.warn('Received non-JSON message; ignoring. raw:', str.substring(0, 200));
+        if (obj.type !== "audio_chunk") return;
+
+        const pcm16 = Buffer.from(obj.audio, "base64");
+        sampleRate = obj.sampleRate ?? sampleRate;
+
+        chunks.push(pcm16);
+        bytesCollected += pcm16.length;
+
+        const bytesPerSec = sampleRate * 2;
+        const needed = bytesPerSec * 2; // ~2 seconds chunks
+
+        if (bytesCollected >= needed) {
+            // finalize audio
+            const buf = Buffer.concat(chunks);
+            chunks = [];
+            bytesCollected = 0;
+
+            const filename = `/tmp/audio_${uuidv4()}.wav`;
+            saveWav(buf, sampleRate, filename);
+
+            // --- TRANSCRIBE ---
+            const transcript = await transcribe(filename);
+            console.log("Transcript:", transcript);
+
+            // Ignore empty/noise transcripts
+            if (!transcript || transcript.trim().length < 2) {
+                console.log("Ignored short transcript");
                 return;
             }
 
-            if (obj.type === 'audio_chunk') {
-                sampleRate = obj.sampleRate || sampleRate;
-                if (!obj.audio) {
-                    console.warn('audio_chunk missing audio field');
-                    return;
-                }
+            // --- LLM RESPONSE ---
+            const response = await runLLM(transcript);
 
-                const pcm16 = Buffer.from(obj.audio, 'base64');
-                if (!Buffer.isBuffer(pcm16) || pcm16.length === 0) {
-                    console.warn('empty pcm16 buffer');
-                    return;
-                }
-
-                chunks.push(pcm16);
-                bytesCollected += pcm16.length;
-
-                console.log('Received audio chunk, bytes:', pcm16.length);
-
-                const bytesPerSec = sampleRate * 2;
-                if (bytesCollected >= bytesPerSec * 2) {
-                    const buffers = Buffer.concat(chunks);
-                    chunks = [];
-                    bytesCollected = 0;
-
-                    const filename = `/tmp/audio_${uuidv4()}.wav`;
-                    try {
-                        saveAsWav(buffers, sampleRate, filename);
-                        console.log('Saved', filename);
-                    } catch (saveErr) {
-                        console.error('Failed to save WAV:', saveErr);
-                        safeSend(ws, { type: 'llm_response', transcript: '', response: 'Server failed to save audio', filename: '' });
-                        return;
-                    }
-
-                    // === INSERTED PROCESSING PIPELINE ===
-                    try {
-                        // immediate quick ack so Unity knows server started processing
-                        safeSend(ws, { type: 'transcript', text: 'processing...', filename });
-
-                        console.log('Calling STT for file:', filename);
-                        const transcript = await safeTranscribe(filename);
-                        console.log('Transcript received from STT:', transcript);
-
-                        // send updated transcript (for quick UI feedback)
-                        safeSend(ws, { type: 'transcript', text: transcript, filename });
-
-                        console.log('Calling LLM with transcript (length', (transcript||'').length, ')');
-                        const llmResponse = await safeQueryLLM(transcript);
-                        console.log('LLM response:', llmResponse);
-
-                        // final reply to client
-                        safeSend(ws, {
-                            type: 'llm_response',
-                            transcript: transcript,
-                            response: llmResponse,
-                            filename: filename
-                        });
-
-                    } catch (err) {
-                        console.error('ERROR in processing pipeline (STT/LLM):', err);
-                        safeSend(ws, { type: 'llm_response', transcript: '', response: 'Server processing error', filename });
-                    }
-                    // === END INSERTED PIPELINE ===
-                }
-            } else if (obj.type === 'control') {
-                console.log('Control message:', obj);
-            } else {
-                console.log('Unknown message type:', obj.type);
-            }
-        } catch (e) {
-            console.error('Error handling incoming message:', e);
+            // send SINGLE message only
+            safeSend(ws, {
+                type: "llm_response",
+                transcript,
+                response,
+                filename
+            });
         }
     });
 
-    ws.on('close', () => {
-        console.log('Client disconnected');
-    });
-
-    ws.on('error', (err) => {
-        console.error('WS error:', err);
-    });
+    ws.on("close", () => console.log("Client disconnected"));
 });
 
-// --- Helper: safe send stringified JSON ---
+// ---- Helpers ----
+
 function safeSend(ws, obj) {
     try {
-        const str = JSON.stringify(obj);
-        ws.send(str);
-        console.log('Sent to client:', str.substring(0, 800));
-    } catch (e) {
-        console.error('safeSend failed:', e);
+        ws.send(JSON.stringify(obj));
+    } catch (err) {
+        console.error("Send error:", err);
     }
 }
 
-// --- Save PCM16 LE buffer as WAV ---
-function saveAsWav(pcmBuffer, sampleRate, outPath) {
+function saveWav(pcmBuffer, sampleRate, outPath) {
     const numChannels = 1;
     const bitsPerSample = 16;
     const byteRate = sampleRate * numChannels * bitsPerSample / 8;
@@ -165,10 +95,10 @@ function saveAsWav(pcmBuffer, sampleRate, outPath) {
     const dataSize = pcmBuffer.length;
 
     const header = Buffer.alloc(44);
-    header.write('RIFF', 0);
+    header.write("RIFF", 0);
     header.writeUInt32LE(36 + dataSize, 4);
-    header.write('WAVE', 8);
-    header.write('fmt ', 12);
+    header.write("WAVE", 8);
+    header.write("fmt ", 12);
     header.writeUInt32LE(16, 16);
     header.writeUInt16LE(1, 20);
     header.writeUInt16LE(numChannels, 22);
@@ -176,50 +106,40 @@ function saveAsWav(pcmBuffer, sampleRate, outPath) {
     header.writeUInt32LE(byteRate, 28);
     header.writeUInt16LE(blockAlign, 32);
     header.writeUInt16LE(bitsPerSample, 34);
-    header.write('data', 36);
+    header.write("data", 36);
     header.writeUInt32LE(dataSize, 40);
 
     fs.writeFileSync(outPath, Buffer.concat([header, pcmBuffer]));
 }
 
-// --- STT using OpenAI Whisper (safe wrapper) ---
-async function safeTranscribe(path) {
+async function transcribe(path) {
     try {
-        if (!fs.existsSync(path)) {
-            console.warn('transcribeAudio: file not found', path);
-            return '';
-        }
         const resp = await openai.audio.transcriptions.create({
             file: fs.createReadStream(path),
             model: "whisper-1"
         });
-        return resp.text || '';
-    } catch (err) {
-        console.error('safeTranscribe error:', err);
-        return '';
+        return resp.text || "";
+    } catch (e) {
+        console.error("STT error", e);
+        return "";
     }
 }
 
-// --- LLM query (safe wrapper) ---
-async function safeQueryLLM(prompt) {
+async function runLLM(prompt) {
     try {
-        const effectivePrompt = (prompt && prompt.length > 0) ? prompt : '(no transcript)';
-        const completion = await openai.chat.completions.create({
-            model: "gpt-3.5-turbo",
-            messages: [{ role: "user", content: effectivePrompt }],
-            temperature: 0.7,
-            max_tokens: 512
+        const r = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.6,
+            max_tokens: 150
         });
-        const text = completion?.choices?.[0]?.message?.content;
-        return text || '';
-    } catch (err) {
-        console.error('safeQueryLLM error:', err);
-        return 'Error: LLM request failed';
+        return r.choices?.[0]?.message?.content || "";
+    } catch (e) {
+        console.error("LLM error", e);
+        return "I'm sorry, I couldn't process that.";
     }
 }
 
-// --- Start server ---
+// START
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-    console.log(`Listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log("Listening on", PORT));
