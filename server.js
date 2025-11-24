@@ -1,100 +1,98 @@
-// ===============================
-// Deepgram Streaming STT VR Server (English-only)
-// ===============================
+// =============================================
+// Deepgram Streaming STT Server (SDK v3.x)
+// For Unity PCM 16k, VR assistant
+// =============================================
 
 const http = require("http");
 const WebSocket = require("ws");
 const { Deepgram } = require("@deepgram/sdk");
 const OpenAI = require("openai");
 
-// Initialize clients
-const deepgram = new Deepgram(process.env.DEEPGRAM_API_KEY);
+// Init API clients
+const deepgram = new Deepgram({ apiKey: process.env.DEEPGRAM_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Simple HTTP endpoint for Render health checks
+// Simple HTTP endpoint
 const server = http.createServer((req, res) => {
-    res.writeHead(200);
-    res.end("Deepgram VR STT Server OK");
+  res.writeHead(200);
+  res.end("Deepgram VR server OK");
 });
 
-// Main WebSocket server
+// WebSocket server
 const wss = new WebSocket.Server({ server, path: "/ws" });
 console.log("WebSocket server ready.");
 
 wss.on("connection", async (ws) => {
-    console.log("Client connected");
+  console.log("Client connected");
 
-    // Create Deepgram live stream
-    const dg = deepgram.listen.live({
-        model: "nova-2",
-        language: "en",           // You requested EN only
-        smart_format: true,
-        encoding: "linear16",
-        sample_rate: 16000,
-        channels: 1,
-        interim_results: false,
-        vad_events: true          // Deepgram will detect speech boundaries
-    });
+  // Create Deepgram streaming connection
+  const dg = deepgram.listenLive({
+    model: "nova-2",
+    language: "en",             // English only
+    smart_format: true,
+    encoding: "linear16",
+    sample_rate: 16000,
+    channels: 1,
+    vad_events: true,           // silence detection
+    interim_results: false
+  });
 
-    // Deepgram stream events
-    dg.on("open", () => console.log("Deepgram stream opened"));
-    dg.on("close", () => console.log("Deepgram stream closed"));
-    dg.on("error", (err) => console.error("Deepgram error:", err));
+  // DG connected
+  dg.on("open", () => console.log("Deepgram stream opened"));
 
-    // When Deepgram detects speech and returns text
-    dg.on("transcriptReceived", async (data) => {
-        try {
-            const alt = data.channel.alternatives[0];
-            if (!alt || !alt.transcript) return;
+  // DG transcript event
+  dg.on("transcript", async (data) => {
+    try {
+      const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
 
-            const text = alt.transcript.trim();
-            if (text.length < 2) return;  // ignore tiny noises
+      if (!transcript || transcript.length < 2) return; // ignore noise
 
-            console.log("STT:", text);
+      console.log("STT:", transcript);
 
-            // Now send text to LLM
-            const llm = await openai.chat.completions.create({
-                model: "gpt-4o-mini",
-                messages: [{ role: "user", content: text }],
-                max_tokens: 200,
-                temperature: 0.5
-            });
+      // ---- Call GPT ----
+      const llm = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: transcript }],
+        max_tokens: 200,
+        temperature: 0.4
+      });
 
-            const response = llm.choices[0].message.content.trim();
-            console.log("LLM:", response);
+      const reply = llm.choices[0].message.content.trim();
+      console.log("LLM:", reply);
 
-            // Send processed message back to Unity
-            ws.send(JSON.stringify({
-                type: "llm_response",
-                transcript: text,
-                response: response
-            }));
+      // ---- Send to Unity ----
+      ws.send(JSON.stringify({
+        type: "llm_response",
+        transcript,
+        response: reply
+      }));
 
-        } catch (err) {
-            console.error("LLM processing error:", err);
-        }
-    });
+    } catch (err) {
+      console.error("LLM error:", err);
+    }
+  });
 
-    // Unity audio chunks → pass straight to Deepgram
-    ws.on("message", (msg) => {
-        let obj;
-        try {
-            obj = JSON.parse(msg.toString());
-        } catch {
-            return;
-        }
+  // Receive PCM chunks from Unity
+  ws.on("message", (msg) => {
+    let obj;
+    try {
+      obj = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
 
-        if (obj.type !== "audio_chunk") return;
+    if (obj.type !== "audio_chunk") return;
 
-        const pcm16 = Buffer.from(obj.audio, "base64");
-        dg.send(pcm16);
-    });
+    const pcm16 = Buffer.from(obj.audio, "base64");
 
-    // When Unity disconnects
-    ws.on("close", () => {
-        console.log("Client disconnected");
-        dg.finish();
-    });
+    // Send directly to Deepgram
+    dg.send(pcm16);
+  });
+
+  ws.on("close", () => {
+    console.log("Client disconnected");
+    dg.close();
+  });
 });
 
 // Start server
