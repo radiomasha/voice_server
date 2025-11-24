@@ -1,7 +1,7 @@
-// =============================================
-// Deepgram Streaming STT Server (SDK v3.x)
-// For Unity PCM 16k, VR assistant
-// =============================================
+// ===============================
+// Deepgram v3 Streaming Server
+// UNITY PCM16 16kHz
+// ===============================
 
 const http = require("http");
 const WebSocket = require("ws");
@@ -9,70 +9,70 @@ const { Deepgram } = require("@deepgram/sdk");
 const OpenAI = require("openai");
 
 // Init API clients
-const deepgram = new Deepgram({ apiKey: process.env.DEEPGRAM_API_KEY });
+const dg = new Deepgram(process.env.DEEPGRAM_API_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Simple HTTP endpoint
+// HTTP (Render needs it)
 const server = http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("Deepgram VR server OK");
+  res.end("Deepgram server OK");
 });
 
 // WebSocket server
 const wss = new WebSocket.Server({ server, path: "/ws" });
-console.log("WebSocket server ready.");
+console.log("WebSocket ready.");
 
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // Create Deepgram streaming connection
-  const dg = deepgram.listenLive({
+  // --- CREATE LIVE DEEPGRAM CONNECTION (v3 syntax) ---
+  const live = await dg.listening.live({
     model: "nova-2",
-    language: "en",             // English only
-    smart_format: true,
+    language: "en",
     encoding: "linear16",
     sample_rate: 16000,
     channels: 1,
-    vad_events: true,           // silence detection
+    vad_events: true,
+    punctuate: true,
     interim_results: false
   });
 
-  // DG connected
-  dg.on("open", () => console.log("Deepgram stream opened"));
+  console.log("Deepgram live session opened");
 
-  // DG transcript event
-  dg.on("transcript", async (data) => {
+  // Receive STT results
+  live.on("transcript", async (dgData) => {
+    const transcript =
+      dgData?.channel?.alternatives?.[0]?.transcript?.trim() || "";
+
+    if (!transcript || transcript.length < 2) return; // ignore silence
+
+    console.log("STT:", transcript);
+
+    // === CALL GPT ===
     try {
-      const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
-
-      if (!transcript || transcript.length < 2) return; // ignore noise
-
-      console.log("STT:", transcript);
-
-      // ---- Call GPT ----
-      const llm = await openai.chat.completions.create({
+      const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: transcript }],
-        max_tokens: 200,
-        temperature: 0.4
+        temperature: 0.4,
+        max_tokens: 200
       });
 
-      const reply = llm.choices[0].message.content.trim();
-      console.log("LLM:", reply);
+      const text = resp.choices?.[0]?.message?.content?.trim() || "";
+      console.log("LLM:", text);
 
-      // ---- Send to Unity ----
-      ws.send(JSON.stringify({
-        type: "llm_response",
-        transcript,
-        response: reply
-      }));
-
+      ws.send(
+        JSON.stringify({
+          type: "llm_response",
+          transcript,
+          response: text
+        })
+      );
     } catch (err) {
-      console.error("LLM error:", err);
+      console.error("GPT error:", err);
     }
   });
 
-  // Receive PCM chunks from Unity
+  // Receive PCM audio from Unity
   ws.on("message", (msg) => {
     let obj;
     try {
@@ -83,18 +83,16 @@ wss.on("connection", async (ws) => {
 
     if (obj.type !== "audio_chunk") return;
 
-    const pcm16 = Buffer.from(obj.audio, "base64");
-
-    // Send directly to Deepgram
-    dg.send(pcm16);
+    const pcm = Buffer.from(obj.audio, "base64");
+    live.send(pcm);
   });
 
   ws.on("close", () => {
     console.log("Client disconnected");
-    dg.close();
+    live.close();
   });
 });
 
 // Start server
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log("Listening on", PORT));
+server.listen(PORT, () => console.log("Listening on port", PORT));
