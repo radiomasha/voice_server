@@ -1,31 +1,31 @@
-// ===============================================
-// Deepgram V2 RAW PCM Stream Server (stable)
-// Unity -> PCM16 -> Deepgram -> GPT -> Unity
-// ===============================================
+// ==========================================================
+// Deepgram V2 — RAW PCM 16kHz Server
+// Unity → PCM → Deepgram → GPT → Unity
+// ==========================================================
 
 const http = require("http");
 const WebSocket = require("ws");
 const OpenAI = require("openai");
-const crypto = require("crypto");
 
-// Deepgram endpoint (V2, stable, supports raw PCM)
-const DG_URL = "wss://api.deepgram.com/v1/listen";
+// Deepgram V2 RAW endpoint
+const DG_URL =
+  "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-2";
 
-// ---------------------------------------
-// HTTP server
-// ---------------------------------------
+// -----------------------------------------------------------
+// HTTP server (Render will open the port automatically)
+// -----------------------------------------------------------
 const server = http.createServer((req, res) => {
   res.writeHead(200);
   res.end("Deepgram V2 RAW server OK");
 });
 
-// ---------------------------------------
-// WebSocket server for Unity
-// ---------------------------------------
+// -----------------------------------------------------------
+// WS server (Unity connects here)
+// -----------------------------------------------------------
 const wss = new WebSocket.Server({
   server,
   path: "/ws",
-  maxPayload: 1024 * 1024,
+  maxPayload: 2 * 1024 * 1024,
   perMessageDeflate: false,
 });
 
@@ -35,31 +35,27 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ---------------------------------------
-// When Unity connects
-// ---------------------------------------
-wss.on("connection", (ws) => {
+// -----------------------------------------------------------
+// UNITY CONNECTS
+// -----------------------------------------------------------
+wss.on("connection", async (ws) => {
   console.log("Unity connected");
 
-  // prevent Render timeout
+  // keep-alive (Render kills idle WS after ~55s)
   const pingInterval = setInterval(() => {
     try {
       ws.send(JSON.stringify({ type: "ping" }));
-    } catch {}
+    } catch (_) {}
   }, 8000);
 
-  // ---------------------------------------
-  // Connect to Deepgram V2 raw WebSocket
-  // ---------------------------------------
-  const dgWs = new WebSocket(
-    DG_URL +
-      "?encoding=linear16&sample_rate=16000&channels=1&model=nova-2",
-    {
-      headers: {
-        Authorization: "Token " + process.env.DEEPGRAM_API_KEY,
-      },
-    }
-  );
+  // ---------------------------------------------------------
+  // CONNECT TO DEEPGRAM RAW PCM SOCKET (V2)
+  // ---------------------------------------------------------
+  const dgWs = new WebSocket(DG_URL, {
+    headers: {
+      Authorization: "Token " + process.env.DEEPGRAM_API_KEY,
+    },
+  });
 
   let dgReady = false;
 
@@ -68,21 +64,20 @@ wss.on("connection", (ws) => {
     console.log("Deepgram V2 connected.");
   });
 
-  dgWs.on("error", (err) => {
-    console.error("Deepgram ERROR:", err);
-  });
-
   dgWs.on("close", () => {
     dgReady = false;
     console.log("Deepgram V2 closed");
   });
 
-  // ---------------------------------------
-  // Deepgram → Transcript → GPT → Unity
-  // ---------------------------------------
+  dgWs.on("error", (err) => {
+    console.error("Deepgram ERROR:", err);
+  });
+
+  // ---------------------------------------------------------
+  // DEEPGRAM → STT → GPT → UNITY
+  // ---------------------------------------------------------
   dgWs.on("message", async (msg) => {
     let data;
-
     try {
       data = JSON.parse(msg);
     } catch {
@@ -96,18 +91,23 @@ wss.on("connection", (ws) => {
 
     console.log("STT:", transcript);
 
-    // GPT
+    // ask GPT
+    let answer = "";
     try {
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: transcript }],
-        max_tokens: 200,
-        temperature: 0.2,
+        max_tokens: 150,
       });
 
-      const answer = resp.choices?.[0]?.message?.content?.trim();
+      answer = resp.choices?.[0]?.message?.content?.trim() || "";
       console.log("LLM:", answer);
+    } catch (err) {
+      console.error("GPT error:", err);
+    }
 
+    // send answer to Unity
+    try {
       ws.send(
         JSON.stringify({
           type: "llm_response",
@@ -115,27 +115,32 @@ wss.on("connection", (ws) => {
           response: answer,
         })
       );
-    } catch (err) {
-      console.error("GPT error:", err);
-    }
+    } catch {}
   });
 
-  // ---------------------------------------
-  // Unity → PCM → Deepgram RAW stream
-  // ---------------------------------------
+  // ---------------------------------------------------------
+  // UNITY → PCM → DEEPGRAM
+  // ---------------------------------------------------------
   ws.on("message", (buffer) => {
     if (!Buffer.isBuffer(buffer)) return;
 
     console.log("PCM bytes:", buffer.length);
 
     if (!dgReady) {
-      console.log("Deepgram not ready yet — skip chunk");
+      console.log("Deepgram not ready — skip");
       return;
     }
 
-    dgWs.send(buffer);
+    try {
+      dgWs.send(buffer);
+    } catch (err) {
+      console.error("Deepgram send error:", err);
+    }
   });
 
+  // ---------------------------------------------------------
+  // CLEANUP
+  // ---------------------------------------------------------
   ws.on("close", () => {
     console.log("Unity disconnected");
     clearInterval(pingInterval);
@@ -146,7 +151,11 @@ wss.on("connection", (ws) => {
   });
 });
 
+// -----------------------------------------------------------
+// START SERVER
+// -----------------------------------------------------------
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () =>
-  console.log("Listening on port", PORT)
-);
+
+server.listen(PORT, () => {
+  console.log("Listening on port", PORT);
+});
