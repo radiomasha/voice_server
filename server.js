@@ -1,14 +1,14 @@
 // ==========================================
-// Deepgram v3 — JSON PCM Stream Server
-// Unity sends JSON { type, sampleRate, audio(base64) }
+// Deepgram v3 — Binary PCM Stream Server
+// Unity sends raw PCM16 bytes (no JSON)
 // ==========================================
 
 const http = require("http");
 const WebSocket = require("ws");
-const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
+const { createClient } = require("@deepgram/sdk");
 const OpenAI = require("openai");
 
-const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+const dg = createClient(process.env.DEEPGRAM_API_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const server = http.createServer((req, res) => {
@@ -22,15 +22,12 @@ console.log("WebSocket ready.");
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // Heartbeat (Render idle fix)
   const pingInterval = setInterval(() => {
     try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
   }, 8000);
 
-  // -------------------------
-  // Deepgram: create stream
-  // -------------------------
-  const live = deepgram.listen.live({
+  // CORRECT DEEPGRAM LIVE SESSION (NO .start())
+  const live = await dg.listen.live({
     model: "nova-2",
     language: "en",
     encoding: "linear16",
@@ -38,83 +35,50 @@ wss.on("connection", async (ws) => {
     channels: 1,
     vad_events: true,
     interim_results: false,
-    smart_format: true,
+    punctuate: true,
   });
 
-  // ---- Deepgram events ----
-  live.on(LiveTranscriptionEvents.Open, () => {
-    console.log("Deepgram session opened.");
+  live.on("open", () => console.log("Deepgram session opened."));
+  live.on("error", (err) => console.error("Deepgram ERROR:", err));
+
+  // STT EVENT
+  live.on("transcript", async (data) => {
+    const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
+    if (!transcript || transcript.length < 2) return;
+
+    console.log("STT:", transcript);
+
     try {
-      live.start();           // <<<<<<<<< ОБЯЗАТЕЛЬНО
-      console.log("Deepgram stream STARTED.");
-    } catch (err) {
-      console.error("Deepgram start() error:", err);
-    }
-  });
-
-  live.on(LiveTranscriptionEvents.Error, (err) =>
-    console.error("Deepgram ERROR:", err)
-  );
-
-  // -------------------------
-  // TRANSCRIPT HANDLER
-  // -------------------------
-  live.on(LiveTranscriptionEvents.Transcript, async (event) => {
-    try {
-      const alt = event?.channel?.alternatives?.[0];
-      const transcript = (alt?.transcript || "").trim();
-
-      if (!transcript || transcript.length < 2) return;
-
-      console.log("STT:", transcript);
-
-      // LLM response
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: transcript }],
+        temperature: 0.2,
         max_tokens: 200,
-        temperature: 0.3,
       });
 
-      const answer =
-        resp.choices?.[0]?.message?.content?.trim() || "No answer.";
-
-      console.log("LLM:", answer);
+      const answer = resp.choices?.[0]?.message?.content?.trim() || "";
 
       ws.send(JSON.stringify({
         type: "llm_response",
         transcript,
         response: answer,
       }));
+
+      console.log("LLM:", answer);
+
     } catch (err) {
-      console.error("Transcript handler error:", err);
+      console.error("GPT error:", err);
     }
   });
 
-  // -------------------------
-  // RECEIVE FROM UNITY
-  // -------------------------
-  ws.on("message", (msg) => {
-    try {
-      let text = Buffer.isBuffer(msg) ? msg.toString("utf8") : msg;
+  // RECEIVE RAW PCM BYTES
+  ws.on("message", (buffer) => {
+    if (!Buffer.isBuffer(buffer)) return;
 
-      let obj;
-      try {
-        obj = JSON.parse(text);
-      } catch {
-        console.warn("Non-JSON ignored");
-        return;
-      }
+    // Debug
+    // console.log("PCM bytes received:", buffer.length);
 
-      if (obj.type !== "audio_chunk") return;
-
-      const pcm = Buffer.from(obj.audio, "base64");
-      console.log("PCM bytes received:", pcm.length);
-
-      live.send(pcm); // send to Deepgram
-    } catch (err) {
-      console.error("WS message error:", err);
-    }
+    live.send(buffer);
   });
 
   ws.on("close", () => {
@@ -122,8 +86,9 @@ wss.on("connection", async (ws) => {
     try { live.finish(); } catch {}
     console.log("Client disconnected");
   });
+
 });
 
-// -------------------------
+// Start server
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log("Listening on port", PORT));
