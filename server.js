@@ -1,6 +1,7 @@
-// ======================================
-// Deepgram v3 Streaming Server (with RAW logs)
-// ======================================
+// ==========================================
+// Deepgram v3 — Binary PCM Stream Server
+// Unity sends raw PCM16 bytes (no JSON)
+// ==========================================
 
 const http = require("http");
 const WebSocket = require("ws");
@@ -21,14 +22,12 @@ console.log("WebSocket ready.");
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // HEARTBEAT (Render fix)
+  // Heartbeat (Render fix)
   const pingInterval = setInterval(() => {
-    try {
-      ws.send(JSON.stringify({ type: "ping" }));
-    } catch {}
+    try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
   }, 8000);
 
-  // Deepgram live session
+  // Deepgram streaming session
   const live = await dg.listen.live({
     model: "nova-2",
     language: "en",
@@ -43,36 +42,7 @@ wss.on("connection", async (ws) => {
   live.on("open", () => console.log("Deepgram session opened."));
   live.on("error", (err) => console.error("Deepgram ERROR:", err));
 
-
-  // ======================================================
-  // RECEIVE RAW WS MESSAGE (NO PARSE)
-  // ======================================================
-  ws.on("message", (msg) => {
-    console.log("\n==== RAW MESSAGE RECEIVED ====");
-    console.log("Type:", typeof msg);
-    console.log("Length:", msg.length);
-
-    let text = msg.toString();
-    console.log("First 200 chars:", text.slice(0, 200));
-
-    let obj;
-    try {
-      obj = JSON.parse(text);
-    } catch (e) {
-      console.log("JSON PARSE FAILED:", e.message);
-      return;
-    }
-
-    if (obj.type !== "audio_chunk") return;
-
-    const pcm = Buffer.from(obj.audio, "base64");
-    console.log("PCM decoded bytes:", pcm.length);
-
-    live.send(pcm);
-  });
-
-
-  // TRANSCRIPT EVENT
+  // Transcript event from Deepgram
   live.on("transcript", async (data) => {
     const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
 
@@ -84,23 +54,29 @@ wss.on("connection", async (ws) => {
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: transcript }],
-        max_tokens: 150,
         temperature: 0.2,
+        max_tokens: 200,
       });
 
       const answer = resp.choices?.[0]?.message?.content?.trim() || "";
       console.log("LLM:", answer);
 
-      ws.send(
-        JSON.stringify({
-          type: "llm_response",
-          transcript,
-          response: answer,
-        })
-      );
+      ws.send(JSON.stringify({
+        type: "llm_response",
+        transcript,
+        response: answer,
+      }));
+
     } catch (err) {
       console.error("GPT error:", err);
     }
+  });
+
+  // Receive raw PCM buffer from Unity
+  ws.on("message", (buffer) => {
+    if (!Buffer.isBuffer(buffer)) return;
+    // console.log("PCM bytes:", buffer.length);
+    live.send(buffer);
   });
 
   ws.on("close", () => {
@@ -110,6 +86,6 @@ wss.on("connection", async (ws) => {
   });
 });
 
-// START
+// Init server
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log("Listening on", PORT));
+server.listen(PORT, () => console.log("Listening on port", PORT));
