@@ -62,15 +62,20 @@ wss.on("connection", (ws) => {
             }
 
             // --- LLM RESPONSE ---
-            const response = await runLLM(transcript);
+           
+if (!transcript || transcript.trim().length < 3) {
+    console.log("Silence detected — no LLM call.");
+    return;
+}
 
-            // send SINGLE message only
-            safeSend(ws, {
-                type: "llm_response",
-                transcript,
-                response,
-                filename
-            });
+const llmResponse = await safeQueryLLM(transcript);
+
+safeSend(ws, {
+    type: 'llm_response',
+    transcript,
+    response: llmResponse,
+    filename
+});
         }
     });
 
