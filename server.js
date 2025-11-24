@@ -1,6 +1,6 @@
 // ==========================================
-// Deepgram v3 — Binary PCM Stream Server
-// Unity sends raw PCM16 bytes (no JSON)
+// Deepgram v3 — JSON + base64 PCM16 stream
+// Unity sends: {"type":"audio_chunk","sampleRate":16000,"audio":"<base64>"}
 // ==========================================
 
 const http = require("http");
@@ -8,26 +8,32 @@ const WebSocket = require("ws");
 const { createClient } = require("@deepgram/sdk");
 const OpenAI = require("openai");
 
+// Инициализация клиентов
 const dg = createClient(process.env.DEEPGRAM_API_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// HTTP-заглушка для Render
 const server = http.createServer((req, res) => {
   res.writeHead(200);
   res.end("Deepgram server OK");
 });
 
+// WebSocket сервер
 const wss = new WebSocket.Server({ server, path: "/ws" });
 console.log("WebSocket ready.");
 
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
+  // Heartbeat, чтобы Render не рвал соединение
   const pingInterval = setInterval(() => {
-    try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
+    try {
+      ws.send(JSON.stringify({ type: "ping" }));
+    } catch {}
   }, 8000);
 
-  // CORRECT DEEPGRAM LIVE SESSION (NO .start())
-  const live = await dg.listen.live({
+  // --- Deepgram live сессия (SDK v3, правильный namespace) ---
+  const live = await dg.transcription.live({
     model: "nova-2",
     language: "en",
     encoding: "linear16",
@@ -41,14 +47,20 @@ wss.on("connection", async (ws) => {
   live.on("open", () => console.log("Deepgram session opened."));
   live.on("error", (err) => console.error("Deepgram ERROR:", err));
 
-  // STT EVENT
-  live.on("transcript", async (data) => {
-    const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
-    if (!transcript || transcript.length < 2) return;
-
-    console.log("STT:", transcript);
-
+  // ГЛАВНОЕ: правильное событие в v3 — "transcriptReceived"
+  live.on("transcriptReceived", async (dgEvent) => {
     try {
+      const alt = dgEvent?.channel?.alternatives?.[0];
+      const transcript = alt?.transcript?.trim();
+
+      if (!transcript || transcript.length < 2) {
+        // шум / тишина
+        return;
+      }
+
+      console.log("STT:", transcript);
+
+      // --- GPT ответ ---
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: transcript }],
@@ -57,38 +69,58 @@ wss.on("connection", async (ws) => {
       });
 
       const answer = resp.choices?.[0]?.message?.content?.trim() || "";
-
-      ws.send(JSON.stringify({
-        type: "llm_response",
-        transcript,
-        response: answer,
-      }));
-
       console.log("LLM:", answer);
 
+      ws.send(
+        JSON.stringify({
+          type: "llm_response",
+          transcript,
+          response: answer,
+        })
+      );
     } catch (err) {
-      console.error("GPT error:", err);
+      console.error("LLM pipeline error:", err);
     }
   });
 
-  // RECEIVE RAW PCM BYTES
-  ws.on("message", (buffer) => {
-    if (!Buffer.isBuffer(buffer)) return;
+  // --- Приём JSON от Unity ---
+  ws.on("message", (data) => {
+    let obj;
+    try {
+      const text = data.toString("utf8");
+      // можно раскомментить если хочешь видеть сырой текст
+      // console.log("RAW WS:", text.slice(0, 200));
+      obj = JSON.parse(text);
+    } catch {
+      // не JSON — игнорим (например, бинарь или мусор)
+      return;
+    }
 
-    // Debug
-    // console.log("PCM bytes received:", buffer.length);
+    if (obj.type !== "audio_chunk" || !obj.audio) return;
 
-    live.send(buffer);
+    // base64 → Buffer (PCM16)
+    const pcm = Buffer.from(obj.audio, "base64");
+    if (!pcm.length) return;
+
+    console.log("PCM bytes decoded:", pcm.length);
+
+    // Шлём сырой PCM в Deepgram
+    try {
+      live.send(pcm);
+    } catch (err) {
+      console.error("Deepgram send error:", err);
+    }
   });
 
   ws.on("close", () => {
     clearInterval(pingInterval);
-    try { live.finish(); } catch {}
+    try {
+      live.finish();
+    } catch {}
     console.log("Client disconnected");
   });
-
 });
 
-// Start server
+// START
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log("Listening on port", PORT));
