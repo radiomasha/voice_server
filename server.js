@@ -15,7 +15,7 @@ const wss = new WebSocket.Server({
   server,
   path: "/ws",
   maxPayload: 1024 * 1024,
-  perMessageDeflate: false
+  perMessageDeflate: false,
 });
 
 console.log("WebSocket ready.");
@@ -23,68 +23,89 @@ console.log("WebSocket ready.");
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  const pingInterval = setInterval(() => {
-    try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
-  }, 8000);
-
-  let live;
+  let live = null;
+  let dgReady = false;
 
   try {
     live = await dg.listen.live({
       model: "nova-2",
       language: "en",
-      format: "pcm",               // <---- ВАЖНО
-      encoding: "linear16",        // <---- ВАЖНО
+      encoding: "linear16",
       sample_rate: 16000,
       channels: 1,
-      smart_format: true,
+      raw: true,
+      audio: {            // ← обязательно для raw PCM
+        source: "microphone"
+      },
       vad_events: true,
       interim_results: false,
+      punctuate: true,
     });
-  } catch (err) {
-    console.error("Deepgram INIT ERROR:", err);
-    return;
+
+    live.on("open", () => {
+      console.log("Deepgram session opened.");
+      dgReady = true;
+    });
+
+    live.on("close", () => {
+      console.log("Deepgram closed");
+      dgReady = false;
+    });
+
+    live.on("error", (err) => {
+      console.error("Deepgram ERROR:", err);
+      dgReady = false;
+    });
+
+    live.on("transcript", async (data) => {
+      const t = data?.channel?.alternatives?.[0]?.transcript?.trim();
+      if (!t) return;
+
+      console.log("STT:", t);
+
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: t }],
+        temperature: 0.2,
+        max_tokens: 200,
+      });
+
+      const answer = resp.choices?.[0]?.message?.content?.trim() || "";
+
+      ws.send(JSON.stringify({
+        type: "llm_response",
+        transcript: t,
+        response: answer,
+      }));
+
+      console.log("LLM:", answer);
+    });
+
+  } catch (e) {
+    console.error("ERROR creating session:", e);
   }
 
-  live.on("open", () => console.log("Deepgram session opened."));
-  live.on("close", () => console.log("Deepgram closed"));
-  live.on("error", (err) => console.error("Deepgram ERROR:", err));
-
-  live.on("transcript", async (data) => {
-    const t = data?.channel?.alternatives?.[0]?.transcript?.trim();
-    if (!t) return;
-
-    console.log("STT:", t);
-
-    const gpt = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: t }],
-      max_tokens: 150,
-      temperature: 0.2,
-    });
-
-    const answer = gpt.choices?.[0]?.message?.content || "";
-
-    ws.send(JSON.stringify({
-      type: "llm_response",
-      transcript: t,
-      response: answer,
-    }));
-
-    console.log("LLM:", answer);
-  });
-
   ws.on("message", (buffer) => {
-    console.log("PCM bytes received:", buffer.length);
-    if (live) live.send(buffer);
+    if (!dgReady) {
+      console.log("PCM received but Deepgram not ready yet. Dropped.");
+      return;
+    }
+
+    if (!Buffer.isBuffer(buffer)) return;
+
+    try {
+      live.send(buffer);
+    } catch (e) {
+      console.error("SEND error:", e);
+    }
   });
 
   ws.on("close", () => {
-    clearInterval(pingInterval);
-    try { live.finish(); } catch {}
+    if (live) {
+      try { live.finish(); } catch {}
+    }
     console.log("Client disconnected");
   });
-
 });
 
 const PORT = process.env.PORT || 8080;
