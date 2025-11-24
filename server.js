@@ -1,6 +1,5 @@
 // ======================================
-// Deepgram v3 Streaming Server
-// Unity 48k PCM → 16k PCM16 chunks
+// Deepgram v3 Streaming Server (with RAW logs)
 // ======================================
 
 const http = require("http");
@@ -22,14 +21,14 @@ console.log("WebSocket ready.");
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // Render anti-idle
+  // HEARTBEAT (Render fix)
   const pingInterval = setInterval(() => {
     try {
       ws.send(JSON.stringify({ type: "ping" }));
     } catch {}
   }, 8000);
 
-  // Deepgram live stream
+  // Deepgram live session
   const live = await dg.listen.live({
     model: "nova-2",
     language: "en",
@@ -37,29 +36,59 @@ wss.on("connection", async (ws) => {
     sample_rate: 16000,
     channels: 1,
     vad_events: true,
-    punctuate: true,
     interim_results: false,
+    punctuate: true,
   });
 
   live.on("open", () => console.log("Deepgram session opened."));
   live.on("error", (err) => console.error("Deepgram ERROR:", err));
 
-  // STT → GPT → Unity
+
+  // ======================================================
+  // RECEIVE RAW WS MESSAGE (NO PARSE)
+  // ======================================================
+  ws.on("message", (msg) => {
+    console.log("\n==== RAW MESSAGE RECEIVED ====");
+    console.log("Type:", typeof msg);
+    console.log("Length:", msg.length);
+
+    let text = msg.toString();
+    console.log("First 200 chars:", text.slice(0, 200));
+
+    let obj;
+    try {
+      obj = JSON.parse(text);
+    } catch (e) {
+      console.log("JSON PARSE FAILED:", e.message);
+      return;
+    }
+
+    if (obj.type !== "audio_chunk") return;
+
+    const pcm = Buffer.from(obj.audio, "base64");
+    console.log("PCM decoded bytes:", pcm.length);
+
+    live.send(pcm);
+  });
+
+
+  // TRANSCRIPT EVENT
   live.on("transcript", async (data) => {
     const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim();
+
     if (!transcript || transcript.length < 2) return;
 
     console.log("STT:", transcript);
 
     try {
-      const r = await openai.chat.completions.create({
+      const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: transcript }],
-        temperature: 0.2,
         max_tokens: 150,
+        temperature: 0.2,
       });
 
-      const answer = r.choices?.[0]?.message?.content?.trim() || "";
+      const answer = resp.choices?.[0]?.message?.content?.trim() || "";
       console.log("LLM:", answer);
 
       ws.send(
@@ -74,29 +103,13 @@ wss.on("connection", async (ws) => {
     }
   });
 
-  ws.on("message", (msg) => {
-    let obj;
-    try {
-      obj = JSON.parse(msg.toString());
-    } catch {
-      return;
-    }
-
-    if (obj.type !== "audio_chunk") return;
-
-    const pcm = Buffer.from(obj.audio, "base64");
-    live.send(pcm);
-  });
-
   ws.on("close", () => {
-    console.log("Client disconnected");
     clearInterval(pingInterval);
-    try {
-      live.finish();
-    } catch {}
+    try { live.finish(); } catch {}
+    console.log("Client disconnected");
   });
 });
 
 // START
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log("Listening on port", PORT));
+server.listen(PORT, () => console.log("Listening on", PORT));
