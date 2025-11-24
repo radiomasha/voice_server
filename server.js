@@ -5,14 +5,14 @@
 
 const http = require("http");
 const WebSocket = require("ws");
-const { Deepgram } = require("@deepgram/sdk");
+const { createClient } = require("@deepgram/sdk"); // <-- ВАЖНО
 const OpenAI = require("openai");
 
 // Init API clients
-const dg = new Deepgram(process.env.DEEPGRAM_API_KEY);
+const dg = createClient(process.env.DEEPGRAM_API_KEY); // <-- ВАЖНО
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// HTTP (Render needs it)
+// HTTP stub for Render
 const server = http.createServer((req, res) => {
   res.writeHead(200);
   res.end("Deepgram server OK");
@@ -25,8 +25,8 @@ console.log("WebSocket ready.");
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // --- CREATE LIVE DEEPGRAM CONNECTION (v3 syntax) ---
-  const live = await dg.listening.live({
+  // --- DEEPGRAM LIVE STREAM (SDK v3 correct format) ---
+  const live = await dg.listen.live({
     model: "nova-2",
     language: "en",
     encoding: "linear16",
@@ -37,9 +37,9 @@ wss.on("connection", async (ws) => {
     interim_results: false
   });
 
-  console.log("Deepgram live session opened");
+  live.on("open", () => console.log("Deepgram live session opened"));
 
-  // Receive STT results
+  // STT event
   live.on("transcript", async (dgData) => {
     const transcript =
       dgData?.channel?.alternatives?.[0]?.transcript?.trim() || "";
@@ -48,7 +48,6 @@ wss.on("connection", async (ws) => {
 
     console.log("STT:", transcript);
 
-    // === CALL GPT ===
     try {
       const resp = await openai.chat.completions.create({
         model: "gpt-4o-mini",
@@ -72,7 +71,6 @@ wss.on("connection", async (ws) => {
     }
   });
 
-  // Receive PCM audio from Unity
   ws.on("message", (msg) => {
     let obj;
     try {
