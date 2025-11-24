@@ -1,6 +1,5 @@
 // ==========================================
-// Deepgram v3 — Binary PCM Stream Server
-// Unity sends raw PCM16 bytes (no JSON)
+// Deepgram v3 — RAW PCM16 Streaming (работает)
 // ==========================================
 
 const http = require("http");
@@ -16,7 +15,6 @@ const server = http.createServer((req, res) => {
   res.end("Deepgram server OK");
 });
 
-// WebSocket сервер
 const wss = new WebSocket.Server({
   server,
   path: "/ws",
@@ -29,68 +27,56 @@ console.log("WebSocket ready.");
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // Пинг, чтобы Render не рвал соединение
   const pingInterval = setInterval(() => {
     try {
       ws.send(JSON.stringify({ type: "ping" }));
-    } catch {}
+    } catch (_) {}
   }, 8000);
 
-  // --- Deepgram live session (v3, raw PCM) ---
+  // ❗ Правильный Deepgram v3 live-сценарий
   const live = await dg.listen.live({
     model: "nova-2",
-    language: "en",
-    encoding: "linear16",
+    format: "pcm16",     // ← вместо raw/encoding
     sample_rate: 16000,
     channels: 1,
-    raw: true,               // сырые PCM-байты
+    punctuate: true,
     vad_events: true,
     interim_results: false,
-    punctuate: true,
   });
 
   live.on("open", () => console.log("Deepgram session opened."));
   live.on("close", () => console.log("Deepgram closed"));
   live.on("error", (err) => console.error("Deepgram ERROR:", err));
 
-  // --- Deepgram → текст ---
+  // Deepgram -> текст
   live.on("transcript", async (data) => {
-    try {
-      const transcript =
-        data?.channel?.alternatives?.[0]?.transcript?.trim() || "";
+    const transcript = data?.channel?.alternatives?.[0]?.transcript?.trim() || "";
 
-      if (!transcript || transcript.length < 2) {
-        // шум / тишина
-        return;
-      }
+    if (!transcript) return;
 
-      console.log("STT:", transcript);
+    console.log("STT:", transcript);
 
-      // --- GPT ---
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: transcript }],
-        temperature: 0.2,
-        max_tokens: 200,
-      });
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: transcript }],
+      temperature: 0.2,
+      max_tokens: 200,
+    });
 
-      const answer = resp.choices?.[0]?.message?.content?.trim() || "";
-      console.log("LLM:", answer);
+    const answer = resp.choices?.[0]?.message?.content?.trim() || "";
 
-      // --- ответ в Unity ---
-      ws.send(
-        JSON.stringify({
-          type: "llm_response",
-          transcript,
-          response: answer,
-        })
-      );
-    } catch (err) {
-      console.error("LLM or send error:", err);
-    }
+    ws.send(
+      JSON.stringify({
+        type: "llm_response",
+        transcript,
+        response: answer,
+      })
+    );
+
+    console.log("LLM:", answer);
   });
 
-  // --- Unity → PCM ---
+  // Unity → PCM
   ws.on("message", (buffer) => {
     if (!Buffer.isBuffer(buffer)) return;
 
@@ -104,16 +90,14 @@ wss.on("connection", async (ws) => {
     try {
       live.send(buffer);
     } catch (err) {
-      console.error("Deepgram send error:", err);
+      console.error("Deepgram SEND error:", err);
     }
   });
 
   ws.on("close", () => {
     clearInterval(pingInterval);
     console.log("Client disconnected");
-    try {
-      live.finish();
-    } catch {}
+    try { live.finish(); } catch {}
   });
 });
 
