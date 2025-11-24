@@ -5,11 +5,11 @@
 
 const http = require("http");
 const WebSocket = require("ws");
-const { createClient } = require("@deepgram/sdk"); // <-- ВАЖНО
+const { createClient } = require("@deepgram/sdk");
 const OpenAI = require("openai");
 
 // Init API clients
-const dg = createClient(process.env.DEEPGRAM_API_KEY); // <-- ВАЖНО
+const dg = createClient(process.env.DEEPGRAM_API_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // HTTP stub for Render
@@ -25,7 +25,7 @@ console.log("WebSocket ready.");
 wss.on("connection", async (ws) => {
   console.log("Client connected");
 
-  // --- DEEPGRAM LIVE STREAM (SDK v3 correct format) ---
+  // --- DEEPGRAM LIVE STREAM (v3 correct format) ---
   const live = await dg.listen.live({
     model: "nova-2",
     language: "en",
@@ -71,6 +71,7 @@ wss.on("connection", async (ws) => {
     }
   });
 
+  // Unity sends PCM
   ws.on("message", (msg) => {
     let obj;
     try {
@@ -85,9 +86,10 @@ wss.on("connection", async (ws) => {
     live.send(pcm);
   });
 
+  // NO close() here — remove it completely
   ws.on("close", () => {
     console.log("Client disconnected");
-    live.close();
+    // Deepgram v3 — nothing to close manually
   });
 });
 
