@@ -1,27 +1,27 @@
-// ==========================================================
-// Deepgram V2 — RAW PCM 16kHz Server
-// Unity → PCM → Deepgram → GPT → Unity
-// ==========================================================
+// ============================================================
+// OpenAI Realtime Proxy for Unity (PCM16 → Realtime → GPT → Unity)
+// Fly.io-ready Node WebSocket server
+// ============================================================
 
 const http = require("http");
 const WebSocket = require("ws");
 const OpenAI = require("openai");
 
-// Deepgram V2 RAW endpoint
-const DG_URL =
-  "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1&model=nova-2";
+// Realtime endpoint (WebSocket upgrade)
+const REALTIME_URL =
+  "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
 
-// -----------------------------------------------------------
-// HTTP server (Render will open the port automatically)
-// -----------------------------------------------------------
+// ------------------------------------------------------------
+// HTTP server for Fly.io
+// ------------------------------------------------------------
 const server = http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("Deepgram V2 RAW server OK");
+  res.end("OpenAI Realtime server OK");
 });
 
-// -----------------------------------------------------------
-// WS server (Unity connects here)
-// -----------------------------------------------------------
+// ------------------------------------------------------------
+// WebSocket server for Unity
+// ------------------------------------------------------------
 const wss = new WebSocket.Server({
   server,
   path: "/ws",
@@ -29,133 +29,143 @@ const wss = new WebSocket.Server({
   perMessageDeflate: false,
 });
 
-console.log("WebSocket ready.");
+console.log("[SERVER] WebSocket ready.");
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// -----------------------------------------------------------
-// UNITY CONNECTS
-// -----------------------------------------------------------
+// ------------------------------------------------------------
+// UNITY → (our server) → OPENAI REALTIME
+// ------------------------------------------------------------
 wss.on("connection", async (ws) => {
-  console.log("Unity connected");
+  console.log("[UNITY] Connected");
 
-  // keep-alive (Render kills idle WS after ~55s)
+  // Keep-alive
   const pingInterval = setInterval(() => {
     try {
       ws.send(JSON.stringify({ type: "ping" }));
-    } catch (_) {}
+    } catch {}
   }, 8000);
 
-  // ---------------------------------------------------------
-  // CONNECT TO DEEPGRAM RAW PCM SOCKET (V2)
-  // ---------------------------------------------------------
-  const dgWs = new WebSocket(DG_URL, {
+  // --------------------------------------------------------
+  // CONNECT TO OPENAI REALTIME
+  // --------------------------------------------------------
+  const rt = new WebSocket(REALTIME_URL, {
     headers: {
-      Authorization: "Token " + process.env.DEEPGRAM_API_KEY,
+      Authorization: "Bearer " + process.env.OPENAI_API_KEY,
+      "OpenAI-Beta": "realtime=v1",
     },
   });
 
-  let dgReady = false;
+  let openaiReady = false;
 
-  dgWs.on("open", () => {
-    dgReady = true;
-    console.log("Deepgram V2 connected.");
+  rt.on("open", () => {
+    console.log("[OpenAI] Realtime connected.");
+    openaiReady = true;
+
+    // Send initial session config
+    rt.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          instructions:
+            "You are an empathetic, friendly VR ambassador. Speak naturally. Respond concisely. Remember context within this session.",
+          modalities: ["text", "audio"], // we accept audio input
+          input_audio_format: "pcm16",
+          input_audio_sample_rate: 16000,
+          output_audio_format: "none", // we use ElevenLabs for TTS
+          turn_detection: { type: "none" }, // unity handles VAD
+        },
+      })
+    );
   });
 
-  dgWs.on("close", () => {
-    dgReady = false;
-    console.log("Deepgram V2 closed");
+  rt.on("close", () => {
+    openaiReady = false;
+    console.log("[OpenAI] Realtime closed");
   });
 
-  dgWs.on("error", (err) => {
-    console.error("Deepgram ERROR:", err);
+  rt.on("error", (err) => {
+    console.error("[OpenAI ERROR]", err);
   });
 
-  // ---------------------------------------------------------
-  // DEEPGRAM → STT → GPT → UNITY
-  // ---------------------------------------------------------
-  dgWs.on("message", async (msg) => {
+  // --------------------------------------------------------
+  // OPENAI REALTIME → UNITY (transcript + final response)
+  // --------------------------------------------------------
+  rt.on("message", (raw) => {
     let data;
     try {
-      data = JSON.parse(msg);
+      data = JSON.parse(raw);
     } catch {
       return;
     }
 
-    const transcript =
-      data?.channel?.alternatives?.[0]?.transcript?.trim() || "";
-
-    if (!transcript || transcript.length < 2) return;
-
-    console.log("STT:", transcript);
-
-    // ask GPT
-    let answer = "";
-    try {
-      const resp = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: transcript }],
-        max_tokens: 150,
-      });
-
-      answer = resp.choices?.[0]?.message?.content?.trim() || "";
-      console.log("LLM:", answer);
-    } catch (err) {
-      console.error("GPT error:", err);
+    // 1) Partial transcript
+    if (data.type === "response.output_text.delta") {
+      ws.send(
+        JSON.stringify({
+          type: "partial",
+          text: data.delta,
+        })
+      );
     }
 
-    // send answer to Unity
-    try {
+    // 2) Final model response (text)
+    if (data.type === "response.completed") {
+      const txt =
+        data?.response?.output_text || data?.response?.output_message;
+
+      let final = "";
+
+      if (Array.isArray(txt)) {
+        for (const t of txt) final += t;
+      }
+
       ws.send(
         JSON.stringify({
           type: "llm_response",
-          transcript,
-          response: answer,
+          response: final.trim(),
         })
       );
-    } catch {}
+
+      console.log("[LLM]", final);
+    }
   });
 
-  // ---------------------------------------------------------
-  // UNITY → PCM → DEEPGRAM
-  // ---------------------------------------------------------
+  // --------------------------------------------------------
+  // UNITY → PCM16 → OPENAI REALTIME
+  // --------------------------------------------------------
   ws.on("message", (buffer) => {
     if (!Buffer.isBuffer(buffer)) return;
 
-    console.log("PCM bytes:", buffer.length);
-
-    if (!dgReady) {
-      console.log("Deepgram not ready — skip");
+    if (!openaiReady) {
+      console.log("[OpenAI] Not ready — skip audio");
       return;
     }
 
-    try {
-      dgWs.send(buffer);
-    } catch (err) {
-      console.error("Deepgram send error:", err);
-    }
+    // Send PCM16 bytes → Realtime
+    rt.send(
+      JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: buffer.toString("base64"),
+      })
+    );
   });
 
-  // ---------------------------------------------------------
+  // --------------------------------------------------------
   // CLEANUP
-  // ---------------------------------------------------------
+  // --------------------------------------------------------
   ws.on("close", () => {
-    console.log("Unity disconnected");
+    console.log("[UNITY] Disconnected");
     clearInterval(pingInterval);
-
     try {
-      dgWs.close();
+      rt.close();
     } catch {}
   });
 });
 
-// -----------------------------------------------------------
-// START SERVER
-// -----------------------------------------------------------
+// ------------------------------------------------------------
+// START HTTP SERVER ON FLY.IO
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 
 server.listen(PORT, () => {
-  console.log("Listening on port", PORT);
+  console.log("[SERVER] Listening on port", PORT);
 });

@@ -1,39 +1,24 @@
-# syntax = docker/dockerfile:1
-
-# Adjust NODE_VERSION as desired
-ARG NODE_VERSION=24.11.0
-FROM node:${NODE_VERSION}-slim AS base
-
-LABEL fly_launch_runtime="Node.js"
-
-# Node.js app lives here
+# ==========================
+# Base image
+# ==========================
+FROM node:24.11.0-slim AS base
 WORKDIR /app
 
-# Set production environment
-ENV NODE_ENV="production"
-
-
-# Throw-away build stage to reduce size of final image
+# ==========================
+# Build stage
+# ==========================
 FROM base AS build
 
-# Install packages needed to build node modules
-RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y build-essential node-gyp pkg-config python-is-python3
+# COPY ONLY package.json (no lock file)
+COPY package.json ./
 
-# Install node modules
-COPY package-lock.json package.json ./
-RUN npm ci
+# install dependencies (no npm ci, because no lockfile)
+RUN npm install --production
 
-# Copy application code
+# copy the rest of the server files
 COPY . .
 
-
-# Final stage for app image
-FROM base
-
-# Copy built application
-COPY --from=build /app /app
-
-# Start the server by default, this can be overwritten at runtime
-EXPOSE 3000
-CMD [ "npm", "run", "start" ]
+# ==========================
+# Start the server
+# ==========================
+CMD ["npm", "start"]
