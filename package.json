@@ -1,13 +1,16 @@
 {
   "name": "voice-server",
   "version": "1.0.0",
+  "private": true,
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "openai": "4.0.0",
-    "ws": "^8.18.3"
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@flydotio/dockerfile": "^0.7.10"
   }
 }
